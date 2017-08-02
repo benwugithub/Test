@@ -1,1 +1,8 @@
 xxxxxxxxxxxx
+VisualStudio Tools:
+Productivity Power Tools 
+Web Essetials SCSS、CSS 壓縮打包
+Microsoft CodeLens Code Health Indicator
+CodeMaid 自動程式排版
+CodeLens 稱為程式碼的「抬頭顯示器」倒是蠻貼切的，例如可以顯示該方法有多少參考
+Editor Guidelines 在文字編輯器裡看出每個判斷式、方法、類別的結構性，虛線顯示關係
