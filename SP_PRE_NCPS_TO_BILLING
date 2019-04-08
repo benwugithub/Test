@@ -1,0 +1,478 @@
+/****** Object:  StoredProcedure [dbo].[SP_PRE_NCPS_TO_BILLING]    Script Date: 2019/3/23 下午 12:44:24 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+--程式代碼:PRE002
+--程式名稱:SP_PRE_NCPS_TO_BILLING
+--程式說明:NCPS ChargeLog的資料寫入BAT_TMP_BILLING
+--建立日期:2017-07-14 By Hank Lu
+--修改日期:
+-- =============================================
+
+CREATE PROCEDURE [dbo].[SP_PRE_NCPS_TO_BILLING]  --視參數是否需要加入
+      @batch_section int
+AS
+--Declare Variable
+DECLARE @exec_flag int              --執行戳記
+       ,@Sp_Code varchar(20)        --程式代碼
+       ,@Sp_Name varchar(200)       --程式名稱
+	   ,@Blk_Name varchar(200)      --區塊功能名稱
+       ,@Desc_d varchar(200)        --細項LOG敘述
+       ,@Desc_m varchar(200)        --監控LOG敘述
+	   ,@Flag varchar(50)           --狀態旗標
+       ,@ErrNumber varchar(10)      --錯誤代碼 
+	   ,@ErrProcedure varchar(200)  --錯誤的Stored Procedure
+	   ,@ErrMessage varchar(200)    --錯誤訊息
+	   ,@ErrLine varchar(10)        --錯誤行號
+	   ,@ErrorSeverity int          --錯誤嚴重性
+	   ,@ErrorState int             --錯誤狀態碼
+	   ,@ChargeLogDate date;        --批次執行日
+
+--Init Variable
+   SET @Sp_Code = 'PRE002'  --待確認
+   SET @Sp_Name = 'SP_PRE_NCPS_TO_BILLING' 
+   SET @ChargeLogDate = (SELECT CAST(chargelog_date AS date) FROM set_sys_para)
+
+SELECT @exec_flag = COUNT(*) --重複執行判斷
+  FROM bat_function_control 
+ WHERE function_name = @Sp_Code
+   AND finish_date = CONVERT(varchar(10), GETDATE(), 112)
+
+IF @exec_flag > 0
+BEGIN
+    SET @Desc_m = @Sp_Name + '本日已執行過，本次不再執行。'
+	SET @Flag = 'WARNING'
+   EXEC batch_record @Sp_Code, @Desc_m, @Flag, 'M'
+ RETURN
+END
+
+--開始執行批次,紀錄LOG
+ SET @Desc_m = @Sp_Name + '開始'
+ SET @Flag = 'START'
+EXEC batch_record @Sp_Code, @Desc_m, @Flag, 'M'
+
+--清除作業過程TABLE
+IF (@batch_section = '1')  --一段批清除所有資料
+BEGIN
+    DELETE bat_tmp_billing
+	 WHERE charge_source = 'NCPS'    
+END
+IF (@batch_section = '2') OR (@batch_section = '3')   --二三段批清除所有資料
+BEGIN
+    DELETE bat_tmp_billing
+     WHERE charge_source = 'NCPS'
+       AND charge_source_file_name IN (SELECT edc_source_file_name FROM pre_ncps_detail_tmp)
+END
+  
+--寫入前先整理NCPS資料
+BEGIN TRY
+　SET @Blk_Name = '整理NCPS_DETAIL資料作業'
+  SET @Desc_d = @Blk_Name + '開始'
+  SET @Flag = 'START'
+ EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+
+ EXEC sp_pre_ncps_convert_data @batch_section
+
+  SET @Desc_d = @Blk_Name + '結束'
+  SET @Flag = 'END'
+ EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+END TRY
+BEGIN CATCH
+     SELECT @ErrNumber = CONVERT(varchar(10),ERROR_NUMBER())
+		   ,@ErrProcedure = ERROR_PROCEDURE()
+		   ,@ErrMessage = ERROR_MESSAGE()
+		   ,@ErrLine = CONVERT(varchar(10), ERROR_LINE())
+		   ,@ErrorSeverity = ERROR_SEVERITY()
+		   ,@ErrorState = ERROR_STATE();  
+		   	   
+	   EXEC batch_error_record @ErrNumber, @ErrProcedure, @ErrMessage, @ErrLine, @Sp_Code, @Sp_Name, @Blk_Name
+
+  RAISERROR (@ErrMessage, @ErrorSeverity, @ErrorState, @ErrProcedure)  --將ERROR拋給呼叫端
+	 RETURN 0;  --中斷此Procedure
+END CATCH
+
+-- 全家特店需抽到POSTPONE FAMILY的TABLE
+BEGIN TRY
+      SET @Blk_Name = '全家特店寫入POSTPONE_FAMILY 並從原始PRE TABLE 移走'
+      SET @Desc_d = @Blk_Name + '開始'
+      SET @Flag = 'START'
+     EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+
+   INSERT INTO pre_ncps_header_postpone_family_tmp   -- HEADER
+   SELECT pnht.*
+     FROM pre_ncps_header_tmp pnht, mdb_merchant_bas mmb
+    WHERE pnht.merchant_no = mmb.mer_no
+      AND mmb.jointly_code='FAMILY'
+
+   DELETE pnht
+	 FROM pre_ncps_header_tmp pnht
+	WHERE pnht.rel_key_header IN (SELECT rel_key_header 
+	                                FROM  pre_ncps_header_postpone_family_tmp )
+	  
+	   
+   INSERT INTO pre_ncps_detail_postpone_family_tmp  --DETAIL
+   SELECT pndt.*, @ChargeLogDate
+     FROM pre_ncps_detail_tmp pndt, mdb_merchant_bas mmb
+    WHERE pndt.merchant_no = mmb.mer_no
+      AND mmb.jointly_code='FAMILY'
+
+   DELETE pndt
+	 FROM pre_ncps_detail_tmp pndt
+    WHERE pndt.rel_key_detail IN (SELECT rel_key_detail 
+	                                FROM pre_ncps_detail_postpone_family_tmp)
+
+   IF (@batch_section = '1') 
+   EXEC SP_PRE_NCPS_FAMILY_COMPARE
+
+END TRY
+BEGIN CATCH
+     SELECT @ErrNumber = CONVERT(varchar(10),ERROR_NUMBER())
+		   ,@ErrProcedure = ERROR_PROCEDURE()
+		   ,@ErrMessage = ERROR_MESSAGE()
+		   ,@ErrLine = CONVERT(varchar(10), ERROR_LINE())
+		   ,@ErrorSeverity = ERROR_SEVERITY()
+		   ,@ErrorState = ERROR_STATE();  
+		   	   
+	   EXEC batch_error_record @ErrNumber, @ErrProcedure, @ErrMessage, @ErrLine, @Sp_Code, @Sp_Name, @Blk_Name
+
+  RAISERROR (@ErrMessage, @ErrorSeverity, @ErrorState, @ErrProcedure)  --將ERROR拋給呼叫端
+	 RETURN 0;  --中斷此Procedure
+END CATCH
+
+BEGIN TRY
+      SET @Blk_Name = '依照特店不同批次清算的設定，寫入DETAIL POSTPONE TABLE (NCPS)'
+      SET @Desc_d = @Blk_Name + '開始'
+      SET @Flag = 'START'
+     EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+
+       IF (@batch_section = '1')    --一段批，將POSTPONE TABLE的資料寫入pre_ncps_detail_tmp，等待後續寫入bat_tmp_billing，並將POSTPONE TABLE 清空
+	   BEGIN
+	       INSERT INTO pre_ncps_detail_tmp
+           SELECT pndpt.*
+		     FROM pre_ncps_detail_postpone_tmp pndpt
+
+		   INSERT INTO pre_ncps_header_tmp
+           SELECT pnhpt.*
+		     FROM pre_ncps_header_postpone_tmp pnhpt
+			
+		 TRUNCATE TABLE pre_ncps_detail_postpone_tmp
+		 TRUNCATE TABLE pre_ncps_header_postpone_tmp
+	   END
+	   ELSE IF (@batch_section = '2')    --二段批只結轉設定為二段批的特店，所以將不為二段批的資料寫入POSTPONE TABLE
+	   BEGIN
+	       INSERT INTO pre_ncps_header_postpone_tmp
+           SELECT pnht.*
+		     FROM pre_ncps_header_tmp pnht, mdb_merchant_bas mmb
+	        WHERE pnht.merchant_no = mmb.mer_no
+	          AND mmb.close_time <> '2'
+			
+		   DELETE pnht
+		     FROM pre_ncps_header_tmp pnht
+			WHERE pnht.rel_key_header IN (SELECT rel_key_header 
+	                                        FROM pre_ncps_header_postpone_tmp)
+			  
+		   INSERT INTO pre_ncps_detail_postpone_tmp
+           SELECT pndt.*
+		     FROM pre_ncps_detail_tmp pndt, mdb_merchant_bas mmb
+	        WHERE pndt.merchant_no = mmb.mer_no
+	          AND mmb.close_time <> '2'
+
+		   DELETE pndt
+		     FROM pre_ncps_detail_tmp pndt
+			WHERE pndt.rel_key_detail IN (SELECT rel_key_detail 
+	                                        FROM pre_ncps_detail_postpone_tmp)
+	   END
+       ELSE IF (@batch_section = '3')    --三段批結轉設定為二或三段批的特店，所以將一段批的資料寫入POSTPONE TABLE
+	   BEGIN
+		   INSERT INTO pre_ncps_header_postpone_tmp
+           SELECT pnht.*
+		     FROM pre_ncps_header_tmp pnht, mdb_merchant_bas mmb
+	        WHERE pnht.merchant_no = mmb.mer_no
+	          AND mmb.close_time = '1'			
+
+		   DELETE pnht
+		     FROM pre_ncps_header_tmp pnht
+			WHERE pnht.rel_key_header IN (SELECT rel_key_header 
+	                                        FROM pre_ncps_header_postpone_tmp)
+			  
+		   INSERT INTO pre_ncps_detail_postpone_tmp
+           SELECT pndt.*
+		     FROM pre_ncps_detail_tmp pndt, mdb_merchant_bas mmb
+	        WHERE pndt.merchant_no = mmb.mer_no
+	          AND mmb.close_time = '1'		
+
+		   DELETE pndt
+		     FROM pre_ncps_detail_tmp pndt
+			WHERE pndt.rel_key_detail IN (SELECT rel_key_detail 
+	                                        FROM pre_ncps_detail_postpone_tmp)											
+	   END
+
+       SET @Blk_Name = '依照特店不同批次清算的設定，寫入POSTPONE TABLE (NCPS)'
+	   SET @Desc_d = @Blk_Name + '結束'
+	   SET @Flag = 'END'
+      EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+			 
+END TRY
+BEGIN CATCH
+     SELECT @ErrNumber = CONVERT(varchar(10),ERROR_NUMBER())
+		   ,@ErrProcedure = ERROR_PROCEDURE()
+		   ,@ErrMessage = ERROR_MESSAGE()
+		   ,@ErrLine = CONVERT(varchar(10), ERROR_LINE())
+		   ,@ErrorSeverity = ERROR_SEVERITY()
+		   ,@ErrorState = ERROR_STATE();  
+		   	   
+	   EXEC batch_error_record @ErrNumber, @ErrProcedure, @ErrMessage, @ErrLine, @Sp_Code, @Sp_Name, @Blk_Name
+
+  RAISERROR (@ErrMessage, @ErrorSeverity, @ErrorState, @ErrProcedure)  --將ERROR拋給呼叫端
+	 RETURN 0;  --中斷此Procedure
+END CATCH
+
+BEGIN TRY
+      SET @Blk_Name = 'NCPS的DETAIL和HEADER資料寫入TMP_BILLING'
+      SET @Desc_d = @Blk_Name + '開始'
+      SET @Flag = 'START'
+     EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+
+   INSERT INTO bat_tmp_billing 
+             ( 
+               in_tx_type_orig 
+              ,mer_no
+              ,term_id
+              ,trace_no
+              ,in_ent_mode_orig
+              ,in_card_type_orig
+              ,batch_no
+              ,sub_batch
+              ,in_close_date
+              ,in_tx_date        --10
+              ,in_tx_time
+              ,card_no
+			  ,exp_date
+              ,authcode
+              ,in_tx_amount
+              ,loan_order_number
+              ,loan_period
+              ,cr_order_number
+              ,cr_rebate_cnt  --20
+              ,in_cr_rebate_amt 
+              ,in_cr_order_pay
+              ,fall_back
+              ,term_entry_cap
+              ,visa_tid
+              ,visa_prod_code
+              ,mc_service_code
+			  ,mc_date_settle
+              ,mc_network_data
+              ,store_id  --30
+              ,product_code
+              ,code
+              ,pos_key_data
+              ,ext_store_data
+              ,cup_pin_flag
+              ,cup_trans_seq  --40
+              ,cup_settle_date
+              ,cup_tx_date
+              ,cup_tx_time
+              ,ccy
+              ,ec_type
+              ,non_onus_loan_flag
+              ,chip_cond_code
+              ,contactless_flag
+              ,mark
+              ,invoice_no  --50
+              ,ref_no
+			  ,cooperated_id
+			  ,ins_datetime
+              ,rel_key_header
+              ,rel_key_detail
+			  ,batch_section
+			  ,log_line_no
+			  ,charge_type
+			  ,charge_source
+			  ,charge_source_file_name
+             )
+        SELECT pndt.trans_type
+              ,LTRIM(RTRIM(pndt.merchant_no))
+              ,LTRIM(RTRIM(pndt.terminal_id))
+              ,pndt.system_trace_no
+              ,pndt.trans_mode
+              ,pndt.card_type
+              ,pnht.batch_number
+              ,pnht.sub_batch_no
+              ,SUBSTRING(pnht.closed_time,1,8)
+              --為取得 TX_DATE 的交易年(CHARGELOG LAYOUT中 TRANS TIME並沒有年)，必須參考 FILE TIME
+              --但 FILE TIME 與 TRANS TIME 有時間差的問題，因此這段程式碼在處理時差所產生垮年ISSUE
+              -- 表示FILE TIME 與 TRANS TIME 之時間差未跨年，可直接取 FILE TIME 的年 作為 TRANS TIME 的年
+			  ,CASE WHEN (CONVERT(INT, SUBSTRING (pndt.file_time,5,4)) < CONVERT(INT, SUBSTRING(pndt.trans_time,1,4)))
+			  　　　THEN CONVERT(VARCHAR(4),CONVERT(INT, SUBSTRING(pndt.file_time, 1, 4)) - 1) +  --年
+			             SUBSTRING (pndt.trans_time,1,2) + --月
+						 SUBSTRING (pndt.trans_time,3,2)   --日
+					ELSE SUBSTRING (pndt.file_time,1,4)  + --年
+					     SUBSTRING (pndt.trans_time,1,2) + --月
+						 SUBSTRING (pndt.trans_time,3,2)   --日
+					END trans_date --10
+              ,CONVERT(VARCHAR(6), SUBSTRING(pndt.trans_time,5,6)) AS trans_time
+              ,LTRIM(RTRIM(pndt.card_no))
+			  ,pndt.date_expired
+              ,LTRIM(RTRIM(pndt.auth_code_response))
+              ,pndt.amount
+              ,pndt.ref_no
+              ,COALESCE (pndt.loan_period, '0')
+              ,pndt.cr_order_number
+              ,pndt.redeem_point     --20
+              ,pndt.in_cr_rebate_amt
+              ,pndt.in_cr_order_pay
+              ,pndt.fall_back
+              ,pndt.term_entry_cap
+              ,pndt.visa_tid
+              ,pndt.visa_production_code
+              ,pndt.service_code
+			  ,pndt.date_settle
+              ,pndt.network_data
+              ,pndt.store_id  --30
+              ,pndt.product_code
+              ,pndt.code
+              ,pndt.pos_key_data
+              ,pndt.ext_store_data
+              ,pndt.cup_pin_flag
+              ,pndt.cup_trans_seq  --40
+              ,pndt.in_cup_settle_date
+              ,pndt.in_cup_tx_date
+              ,pndt.in_cup_tx_time
+              ,pndt.currency_code
+              ,pndt.ec_type
+              ,pndt.other_flag
+              ,pndt.chip_condition_code
+              ,pndt.contactless_flag
+              ,pndt.mark
+              ,pndt.invoice  --50
+              ,pndt.ref_no			  
+			  ,CASE WHEN pndt.code = 'P'
+			        THEN 'PX'  --全聯特店
+					ELSE ''
+					 END
+			  ,getdate()
+              ,pndt.rel_key_header
+              ,pndt.rel_key_detail
+			  ,@batch_section
+			  ,pndt.log_line_no
+			  ,'EDC'
+			  ,'NCPS'
+			  ,pnht.edc_source_file_name
+          FROM pre_ncps_detail_tmp pndt, pre_ncps_header_tmp pnht
+         WHERE pndt.rel_key_header = pnht.rel_key_header
+		   AND RTRIM(LTRIM(pndt.mark)) = ''
+		   AND pndt.unbalance <> 'PX'   --全聯PX不平帳檔案不入帳(不進BAT_TMP_BILLING)
+
+		   SET @Blk_Name = 'NCPS的DETAIL和HEADER資料寫入TMP_BILLING'
+		   SET @Desc_d = @Blk_Name + '結束'
+		   SET @Flag = 'END'
+		  EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+END TRY
+BEGIN CATCH
+     SELECT @ErrNumber = CONVERT(varchar(10),ERROR_NUMBER())
+		   ,@ErrProcedure = ERROR_PROCEDURE()
+		   ,@ErrMessage = ERROR_MESSAGE()
+		   ,@ErrLine = CONVERT(varchar(10), ERROR_LINE())
+		   ,@ErrorSeverity = ERROR_SEVERITY()
+		   ,@ErrorState = ERROR_STATE();  
+		   	   
+	   EXEC batch_error_record @ErrNumber, @ErrProcedure, @ErrMessage, @ErrLine, @Sp_Code, @Sp_Name, @Blk_Name
+
+  RAISERROR (@ErrMessage, @ErrorSeverity, @ErrorState, @ErrProcedure)  --將ERROR拋給呼叫端
+	 RETURN 0;  --中斷此Procedure
+END CATCH
+
+--將NCPS請款資料抄寫至備份TABLE
+BEGIN TRY
+      SET @Blk_Name = '將NCPS DETAIL請款資料抄寫至備份TABLE'
+      SET @Desc_d = @Blk_Name + '開始'
+      SET @Flag = 'START'
+     EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+
+       IF (@batch_section = '1')
+	   BEGIN 
+           IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_detail_tmp_all]') AND type = N'U')
+           BEGIN
+               TRUNCATE TABLE pre_ncps_detail_tmp_all		   
+               DROP TABLE pre_ncps_detail_tmp_all			   
+           END
+		   IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_header_tmp_all]') AND type = N'U')
+           BEGIN
+		       TRUNCATE TABLE pre_ncps_header_tmp_all		   
+               DROP TABLE pre_ncps_header_tmp_all
+		   END
+		   IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_detail_tmp_all]') AND type = N'U')
+		   BEGIN
+		       SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 
+			     INTO pre_ncps_detail_tmp_all
+				 FROM pre_ncps_detail_tmp
+		   END
+		   IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_header_tmp_all]') AND type = N'U')   
+		   BEGIN
+			   SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 
+			     INTO pre_ncps_header_tmp_all
+				 FROM pre_ncps_header_tmp
+           END
+	   END
+	   IF (@batch_section = '2' OR @batch_section = '3')
+	   BEGIN
+	       IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_header_tmp_all]') AND type = N'U')
+           BEGIN
+		       DELETE FROM pre_ncps_header_tmp_all WHERE batch_section = @batch_section
+			   INSERT INTO pre_ncps_header_tmp_all
+		       SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 			     
+				 FROM pre_ncps_header_tmp
+		   END
+		   IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_header_tmp_all]') AND type = N'U')   
+		   BEGIN
+			   SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 
+			     INTO pre_ncps_header_tmp_all
+				 FROM pre_ncps_header_tmp
+           END
+	       IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_detail_tmp_all]') AND type = N'U')
+           BEGIN    --若TABLE存在，將TABLE內對應批段的資料刪除後再寫入
+		       DELETE FROM pre_ncps_detail_tmp_all WHERE batch_section = @batch_section
+			   INSERT INTO pre_ncps_detail_tmp_all
+		       SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 			     
+				 FROM pre_ncps_detail_tmp
+           END
+		   IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[pre_ncps_detail_tmp_all]') AND type = N'U')
+		   BEGIN   --若TABLE不存在，直接寫入
+		       SELECT *, @batch_section AS batch_section, @ChargeLogDate AS data_date, GETDATE() AS ins_datetime 
+			     INTO pre_ncps_detail_tmp_all
+				 FROM pre_ncps_detail_tmp
+		   END
+	   END
+	   SET @Blk_Name = '將NCPS DETAIL請款資料抄寫至備份TABLE'
+       SET @Desc_d = @Blk_Name + '結束'
+       SET @Flag = 'END'
+      EXEC batch_record @Sp_Code, @Desc_d, @Flag, 'D'
+END TRY
+BEGIN CATCH
+     SELECT @ErrNumber = CONVERT(varchar(10),ERROR_NUMBER())
+		   ,@ErrProcedure = ERROR_PROCEDURE()
+		   ,@ErrMessage = ERROR_MESSAGE()
+		   ,@ErrLine = CONVERT(varchar(10), ERROR_LINE())
+		   ,@ErrorSeverity = ERROR_SEVERITY()
+		   ,@ErrorState = ERROR_STATE();  
+		   	   
+	   EXEC batch_error_record @ErrNumber, @ErrProcedure, @ErrMessage, @ErrLine, @Sp_Code, @Sp_Name, @Blk_Name
+
+  RAISERROR (@ErrMessage, @ErrorSeverity, @ErrorState, @ErrProcedure)  --將ERROR拋給呼叫端
+	 RETURN 0;  --中斷此Procedure
+END CATCH
+
+
+--更新 Finish_Date 避免重複執行
+UPDATE bat_function_control
+   SET finish_date = CONVERT(varchar(10),GETDATE(),112)
+ WHERE function_name = 'PRE002'  --待修正
+
+--寫入結束LOG
+ SET @Desc_m = @Sp_Name + '結束'
+ SET @Flag = 'END'
+EXEC batch_record @Sp_Code, @Desc_m, @Flag, 'M'
+GO
